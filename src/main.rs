@@ -3,7 +3,9 @@
 #![allow(clippy::cmp_owned)]
 
 // Reference local files
+mod config;
 mod duplicates;
+mod instance_info;
 mod post;
 mod search;
 mod settings;
@@ -12,13 +14,14 @@ mod user;
 mod utils;
 
 // Import Crates
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 
 use futures_lite::FutureExt;
 use hyper::{header::HeaderValue, Body, Request, Response};
 
 mod client;
 use client::{canonical_path, proxy};
+use once_cell::sync::Lazy;
 use server::RequestExt;
 use utils::{error, redirect, ThemeAssets};
 
@@ -129,8 +132,10 @@ async fn main() {
 				.short('p')
 				.long("port")
 				.value_name("PORT")
+				.env("PORT")
 				.help("Port to listen on")
 				.default_value("8080")
+				.action(ArgAction::Set)
 				.num_args(1),
 		)
 		.arg(
@@ -144,16 +149,23 @@ async fn main() {
 		)
 		.get_matches();
 
-	let address = matches.get_one("address").map(|m: &String| m.as_str()).unwrap_or("0.0.0.0");
-	let port = std::env::var("PORT").unwrap_or_else(|_| matches.get_one("port").map(|m: &String| m.as_str()).unwrap_or("8080").to_string());
+	let address = matches.get_one::<String>("address").unwrap();
+	let port = matches.get_one::<String>("port").unwrap();
 	let hsts = matches.get_one("hsts").map(|m: &String| m.as_str());
 
-	let listener = [address, ":", &port].concat();
+	let listener = [address, ":", port].concat();
 
 	println!("Starting Libreddit...");
 
 	// Begin constructing a server
 	let mut app = server::Server::new();
+
+	// Force evaluation of statics. In instance_info case, we need to evaluate
+	// the timestamp so deploy date is accurate - in config case, we need to
+	// evaluate the configuration to avoid paying penalty at first request.
+
+	Lazy::force(&config::CONFIG);
+	Lazy::force(&instance_info::INSTANCE_INFO);
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -174,9 +186,21 @@ async fn main() {
 	app
 		.at("/manifest.json")
 		.get(|_| resource(include_str!("../static/manifest.json"), "application/json", false).boxed());
-	app
-		.at("/robots.txt")
-		.get(|_| resource("User-agent: *\nDisallow: /u/\nDisallow: /user/", "text/plain", true).boxed());
+	app.at("/robots.txt").get(|_| {
+		resource(
+			if match config::get_setting("LIBREDDIT_ROBOTS_DISABLE_INDEXING") {
+				Some(val) => val == "on",
+				None => false,
+			} {
+				"User-agent: *\nDisallow: /"
+			} else {
+				"User-agent: *\nDisallow: /u/\nDisallow: /user/"
+			},
+			"text/plain",
+			true,
+		)
+		.boxed()
+	});
 	app.at("/favicon.ico").get(|_| favicon().boxed());
 	app.at("/logo.png").get(|_| pwa_logo().boxed());
 	app.at("/Inter.var.woff2").get(|_| font().boxed());
@@ -282,6 +306,10 @@ async fn main() {
 	// Handle about pages
 	app.at("/about").get(|req| error(req, "About pages aren't added yet".to_string()).boxed());
 
+	// Instance info page
+	app.at("/info").get(|r| instance_info::instance_info(r).boxed());
+	app.at("/info.:extension").get(|r| instance_info::instance_info(r).boxed());
+
 	app.at("/:id").get(|req: Request<Body>| {
 		Box::pin(async move {
 			match req.param("id").as_deref() {
@@ -289,7 +317,7 @@ async fn main() {
 				Some("best" | "hot" | "new" | "top" | "rising" | "controversial") => subreddit::community(req).await,
 
 				// Short link for post
-				Some(id) if (5..7).contains(&id.len()) => match canonical_path(format!("/{}", id)).await {
+				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/{}", id)).await {
 					Ok(path_opt) => match path_opt {
 						Some(path) => Ok(redirect(path)),
 						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,

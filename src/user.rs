@@ -1,7 +1,7 @@
 // CRATES
 use crate::client::json;
 use crate::server::RequestExt;
-use crate::utils::{error, filter_posts, format_url, get_filters, param, setting, template, Post, Preferences, User};
+use crate::utils::{error, filter_posts, format_url, get_filters, nsfw_landing, param, setting, template, Post, Preferences, User};
 use askama::Template;
 use hyper::{Body, Request, Response};
 use time::{macros::format_description, OffsetDateTime};
@@ -26,6 +26,7 @@ struct UserTemplate {
 	all_posts_filtered: bool,
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
+	no_posts: bool,
 }
 
 // FUNCTIONS
@@ -45,7 +46,17 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Retrieve other variables from Libreddit request
 	let sort = param(&path, "sort").unwrap_or_default();
 	let username = req.param("name").unwrap_or_default();
+
+	// Retrieve info from user about page.
 	let user = user(&username).await.unwrap_or_default();
+
+	let req_url = req.uri().to_string();
+	// Return landing page if this post if this Reddit deems this user NSFW,
+	// but we have also disabled the display of NSFW content or if the instance
+	// is SFW-only.
+	if user.nsfw && crate::utils::should_be_nsfw_gated(&req, &req_url) {
+		return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
+	}
 
 	let filters = get_filters(&req);
 	if filters.contains(&["u_", &username].concat()) {
@@ -55,31 +66,34 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 			sort: (sort, param(&path, "t").unwrap_or_default()),
 			ends: (param(&path, "after").unwrap_or_default(), "".to_string()),
 			listing,
-			prefs: Preferences::new(req),
+			prefs: Preferences::new(&req),
 			url,
 			redirect_url,
 			is_filtered: true,
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
+			no_posts: false,
 		})
 	} else {
 		// Request user posts/comments from Reddit
 		match Post::fetch(&path, false).await {
 			Ok((mut posts, after)) => {
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
-				let all_posts_hidden_nsfw = posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on";
+				let no_posts = posts.is_empty();
+				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
 				template(UserTemplate {
 					user,
 					posts,
 					sort: (sort, param(&path, "t").unwrap_or_default()),
 					ends: (param(&path, "after").unwrap_or_default(), after),
 					listing,
-					prefs: Preferences::new(req),
+					prefs: Preferences::new(&req),
 					url,
 					redirect_url,
 					is_filtered: false,
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
+					no_posts,
 				})
 			}
 			// If there is an error show error page
@@ -111,6 +125,7 @@ async fn user(name: &str) -> Result<User, String> {
 			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
 			banner: about("banner_img"),
 			description: about("public_description"),
+			nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
 		}
 	})
 }
